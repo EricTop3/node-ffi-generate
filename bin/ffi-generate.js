@@ -1,87 +1,195 @@
 #!/usr/bin/env node
 
-var jsb = require('js-beautify');
-var argv = require('optimist')
-  .usage('Generate node-ffi bindings for a given header file\nUsage: $0')
-  .demand('f').alias('f', 'file').describe('f', 'The header file to parse')
-  .demand('l').alias('l', 'library').describe('l', 'The name of the library to dlopen')
-  .alias('m', 'module').describe('m', 'The name of module the bindings will be exported as')
-  .boolean('x').alias('x', 'file_only').describe('x', 'Only export functions found in this file')
-  .alias('p', 'prefix').describe('p', 'Only import functions whose name start with prefix')
-  .boolean('s').alias('s', 'strict').describe('s', 'Use StrictType (experimental)')
-  .alias('L', 'libclang').describe('L', 'Path to directory where libclang.{so,dylib} is located')
-  .argv
+// Copyright 2011, 2012, 2013, 2014 Timothy J Fontaine <tjfontaine@gmail.com>
+// Copyright 2020, 2021 Joel Purra <https://joelpurra.com/>
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the 'Software'), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE
 
-function tryClang(cb) {
-  var libclang;
+const path = require("path");
+const engineCheck = require("engine-check");
+const execa = require("execa");
+const {
+	pick,
+} = require("lodash");
+const yargs = require("yargs");
+const SegfaultHandler = require("segfault-handler");
+const {
+	delay,
+} = require("bluebird");
 
-  try {
-    libclang = require('libclang');
-  } catch (e) {
-    libclang = false;
-  }
+const tryRetryLoadLibclang = async () => {
+	try {
+		// NOTE: if this succeeds, the libclang library could be loaded by dlopen().
+		// eslint-disable-next-line import/no-unassigned-import
+		require("@ffi-packager/libclang");
+	} catch (libclangLoadError) {
+		if (libclangLoadError.code === "ENOENT") {
+			const libraryPathEnvironmentVariableName = process.platform === "darwin" ? "DYLD_LIBRARY_PATH" : "LD_LIBRARY_PATH";
 
-  if (libclang) return cb(true);
+			if (process.env.FFI_GENERATE_RETRY) {
+				throw new Error(`Could not load the libclang library (check ${libraryPathEnvironmentVariableName}). ${JSON.stringify(pick(
+					process.env,
+					[
+						"FFI_GENERATE_RETRY",
+						libraryPathEnvironmentVariableName,
+					],
+				))}`);
+			}
 
-  if (process.env.FFI_GENERATE_CHILD) return cb(false);
+			let llvmConfigLibDir;
 
-  require('child_process').exec('llvm-config --libdir', function (err, stdout, stderr) {
-    if (stdout.trim()) {
-      cb(stdout.trim());
-    } else {
-      cb(err.code);
-    }
-  });
-}
+			try {
+				llvmConfigLibDir = await execa("llvm-config", [
+					"--libdir",
+				]);
+			} catch (llvmConfigExecaError) {
+				// https://github.com/sindresorhus/execa/blob/1ac56eac5f6e993fd2a2a3ad308fd5c18deb25a9/test/test.js#L10
+				const ENOENT_REGEXP = process.platform === "win32" ? /failed with exit code 1/ : /spawn.* ENOENT/;
 
-function generate() {
-  var generate = require('../lib/generateffi').generate;
+				if (ENOENT_REGEXP.test(llvmConfigExecaError)) {
+					throw new Error(`Could not find llvm-config (check PATH). ${JSON.stringify(pick(
+						process.env,
+						[
+							"PATH",
+						],
+					))}`);
+				}
 
-  var ret = generate({
-    filename: argv.f,
-    library: argv.l,
-    module: argv.m,
-    prefix: argv.p,
-    compiler_args: argv._,
-    strict_type: argv.s,
-    single_file: argv.x,
-  });
+				throw llvmConfigExecaError;
+			}
 
-  //console.log(jsb.js_beautify(ret.serialized));
-  console.log(ret.serialized);
+			try {
+				// NOTE: re-execute this javascript file with added environment variables.
+				const reexecute = execa.node(
+					__filename,
+					process.argv.slice(2),
+					{
+						env: {
+							FFI_GENERATE_RETRY: process.pid,
+							[libraryPathEnvironmentVariableName]: [
+								llvmConfigLibDir.stdout,
+								...(
+									process.env[libraryPathEnvironmentVariableName]
+										? process.env[libraryPathEnvironmentVariableName].split(":")
+										: []
+								),
+							].join(":"),
+						},
+					},
+				);
+				reexecute.stdout.pipe(process.stdout);
+				reexecute.stderr.pipe(process.stderr);
 
-  if (generate.unmapped) {
-    process.stderr.write("-------Unmapped-------\r\n");
-    process.stderr.write(generate.unmapped + '\r\n');
-  }
-}
+				await reexecute;
+			} catch (reexecuteError) {
+				const ffiGenerateMissingArguments = /Missing required arguments/;
 
-tryClang(function (ret) {
-  var library;
+				// NOTE: ignore output with missing arguments message from own code -- that's a "good" result.
+				if (!ffiGenerateMissingArguments.test(reexecuteError)) {
+					throw reexecuteError;
+				}
+			}
 
-  if (isNaN(ret)) library = ret;
-  if (argv.L) library = argv.L;
+			return false;
+		}
 
-  if (ret === true) {
-    generate();
-  } else if (library && ret !== false) {
-    var env = process.env;
-    env.FFI_GENERATE_CHILD = '1';
-    switch (process.platform) {
-      case 'darwin':
-        env.DYLD_LIBRARY_PATH = library + ':' + (env.DYLD_LIBRARY_PATH || '');
-        break;
-      default:
-        env.LD_LIBRARY_PATH = library + ':' + (env.LD_LIBRARY_PATH || '');
-        break;
-    }
-    var c = require('child_process').spawn(process.execPath, process.argv.slice(1), {env:env});
-    c.stdout.pipe(process.stdout);
-    c.stderr.pipe(process.stderr);
-    c.on('exit', function (code) {
-      process.exit(code);
-    });
-  } else {
-    console.error('Unable to load libclang, make sure you have 3.2 installed, either specify -L or have llvm-config in your path');
-  }
-});
+		throw libclangLoadError;
+	}
+
+	return true;
+};
+
+const runGenerator = async () => {
+	const {
+		generate,
+	} = require("..");
+
+	const {
+		argv,
+	} = yargs
+		.usage("Generate node-ffi-napi javascript bindings for a given C/C++ header file")
+		.demand("f").alias("f", "file").describe("f", "The header file to parse")
+		.demand("l").alias("l", "library").describe("l", "The name of the library to dlopen. Set to null to use functions in the current process.")
+		.boolean("x").alias("x", "single-file").describe("x", "Only export functions found in this file")
+		.alias("p", "prefix").describe("p", "Only import functions whose name start with prefix. Can be specified multiple times.");
+
+	const generated = await generate({
+		compilerArgs: argv._,
+		filepath: argv.f,
+		library: argv.l,
+		// eslint-disable-next-line unicorn/prefer-spread
+		prefixes: argv.p ? [].concat(argv.p) : undefined,
+		singleFile: argv.x,
+	});
+
+	// eslint-disable-next-line no-console
+	console.log(generated.serialized);
+
+	if (generated.unmapped.length > 0) {
+		// eslint-disable-next-line no-console
+		console.warn("----- UNMAPPED -----", JSON.stringify(generated.unmapped, null, 2));
+	}
+
+	// NOTE: sleep to allow for (async) cleanup; otherwise there's a race condition segfault.
+	// NOTE: segfault is (usually) not noticeable when running debuggers etcetera; do they slow down the process enough for cleanup to finish?
+	// TODO: verify that the delay helps, and that it's not too short/long for (testable) usage.
+	// TODO: don't delay.
+	await delay(50);
+};
+
+const loadAndGenerate = async () => {
+	const succeeded = await tryRetryLoadLibclang();
+
+	if (succeeded) {
+		await runGenerator();
+	}
+};
+
+const mainAsync = async () => {
+	try {
+		await loadAndGenerate();
+	} catch (error) {
+		// NOTE: root error handler for asynchronous errors.
+		// eslint-disable-next-line no-console
+		console.error(error);
+
+		process.exitCode = 1;
+	}
+};
+
+const main = () => {
+	try {
+		engineCheck({
+			searchRoot: path.join(__dirname, ".."),
+		});
+
+		const segfaultHandlerLogName = `ffi-generate.segfault.${new Date().toISOString().replace(/:/g, "").toLowerCase()}.${process.pid}.log`;
+		SegfaultHandler.registerHandler(segfaultHandlerLogName);
+
+		mainAsync();
+	} catch (error) {
+		// NOTE: root error handler for synchronous errors.
+		// eslint-disable-next-line no-console
+		console.error(error);
+
+		process.exitCode = 1;
+	}
+};
+
+main();
